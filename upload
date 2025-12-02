@@ -1,0 +1,31 @@
+import os
+from unsloth import FastVisionModel
+from peft import PeftModel
+
+base_model = "unsloth/Qwen3-VL-8B-Instruct"    # change to the real base model you used
+adapter_path = "finetuned_generator"
+repo_id = "vietmed/qwen_9500_domain"
+
+# optional: export HF_TOKEN in your shell first
+
+print("Load base model")
+model, tokenizer = FastVisionModel.from_pretrained(
+    base_model,
+    load_in_4bit = True,
+    use_gradient_checkpointing = "unsloth",
+)
+
+print("Attach LoRA adapter")
+model = PeftModel.from_pretrained(
+    model,
+    adapter_path,
+)
+
+print("Push LoRA to Hub")
+model.push_to_hub_merged(
+    repo_id,
+    tokenizer,
+    save_method = "lora",
+)
+
+print("Done")
