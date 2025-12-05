@@ -4,27 +4,24 @@
 """
 Mixed-domain VLM fine-tune script for Unsloth + Qwen3-VL-8B.
 
-Pipeline:
-1. Load domain JSONL (your patent tables etc).
-2. Filter out artefact_type == "logo".
-3. Random sample from domain data.
-4. From huggingface-m4/finevision, stream subsets in RECOMMENDED_FINEVISION_SUBSETS.
-5. From each subset, sample some general vision QA examples.
-6. For streamed general data, dump image objects to a temporary folder
-   and replace the image field with the file path (always .png).
-7. Normalize both domain and general examples into a common schema.
-8. Mix the data and split into train and val.
-9. Convert to Unsloth "messages" format and fine tune.
-10. Run inference on the validation split.
-11. Save prediction results.
-12. Use an LLM judge (gpt-5 over Braintrust) that sees only:
-    - question
-    - context
-    - model answer
-    - image path
-    Gold label is stored only for analysis.
-13. Save a cocktail JSONL with judge scores.
-14. Recommend the highest score sample and save it as JSON.
+Two-stage mixture with parameter grid:
+
+Stage 1:
+    - User sets max_domain_samples.
+    - Script samples domain once.
+    - For each domain ratio p in DOMAIN_RATIO_GRID:
+        * Compute general size G = D * (1 - p) / p.
+        * Optionally clamp by general_samples as a cap.
+
+Stage 2:
+    - For each subset weight config in SUBSET_WEIGHT_GRID:
+        * Allocate G across FineVision subsets by subset weights.
+        * Randomly sample from each subset using streaming.
+
+For each (p, subset_weights) pair:
+    - Build mixed dataset via probabilistic interleaving.
+    - Train, run inference, run LLM judge.
+    - Track best configuration by average judge score.
 """
 
 import argparse
@@ -34,6 +31,7 @@ import os
 import random
 import uuid
 from pathlib import Path
+from typing import Dict, Optional, List, Tuple
 
 from datasets import load_dataset, Image as HFImage
 from tqdm import tqdm
@@ -41,9 +39,13 @@ from tqdm import tqdm
 import torch
 from PIL import Image as PILImage
 
+from dotenv import load_dotenv
 from unsloth import FastVisionModel
 from unsloth.trainer import UnslothVisionDataCollator
 from trl import SFTTrainer, SFTConfig
+
+# Load env once
+load_dotenv()
 
 # Optional judge client
 try:
@@ -51,6 +53,9 @@ try:
 except ImportError:
     OpenAI = None
 
+# ------------------------------------------------------------
+# Parameter grids
+# ------------------------------------------------------------
 
 RECOMMENDED_FINEVISION_SUBSETS = [
     "CoSyn_400k_table",
@@ -59,6 +64,44 @@ RECOMMENDED_FINEVISION_SUBSETS = [
     "textvqa",
     "chartqa",
     "infographic_vqa",
+]
+
+# Stage 1: domain ratios p = domain / (domain + general)
+DOMAIN_RATIO_GRID: List[float] = [
+    0.70,
+    0.60,
+    0.50,
+]
+
+# Stage 2: different subset weighting strategies
+SUBSET_WEIGHT_GRID: List[Dict[str, float]] = [
+    # Strong table heavy
+    {
+        "CoSyn_400k_table": 0.50,
+        "docvqa": 0.20,
+        "pdfvqa": 0.15,
+        "textvqa": 0.10,
+        "chartqa": 0.03,
+        "infographic_vqa": 0.02,
+    },
+    # Balanced doc + table
+    {
+        "CoSyn_400k_table": 0.40,
+        "docvqa": 0.25,
+        "pdfvqa": 0.15,
+        "textvqa": 0.10,
+        "chartqa": 0.05,
+        "infographic_vqa": 0.05,
+    },
+    # More general heavy
+    {
+        "CoSyn_400k_table": 0.30,
+        "docvqa": 0.20,
+        "pdfvqa": 0.20,
+        "textvqa": 0.20,
+        "chartqa": 0.05,
+        "infographic_vqa": 0.05,
+    },
 ]
 
 
@@ -73,7 +116,7 @@ def ensure_dir(path: str):
 def save_stream_image_to_disk(img_obj, tmp_dir: str) -> str:
     """
     Save a streamed image to disk as a real PNG file.
-    Always produces: tmp_images/<uuid>.png
+    Output: tmp_dir/<uuid>.png
 
     Supported inputs:
     - datasets.Image (HFImage)
@@ -126,7 +169,7 @@ def save_stream_image_to_disk(img_obj, tmp_dir: str) -> str:
                     f"Image bytes exist but cannot be decoded into a valid image. Error: {e}"
                 )
 
-        # Embedded path inside dict
+        # Embedded path
         if img_obj.get("path") is not None:
             embedded = img_obj["path"]
             try:
@@ -138,7 +181,6 @@ def save_stream_image_to_disk(img_obj, tmp_dir: str) -> str:
             except Exception as e:
                 raise ValueError(f"Image path inside dict cannot be opened: {embedded}. Error: {e}")
 
-    # If nothing matched, throw
     raise TypeError(
         f"Unsupported image type from FineVision: {type(img_obj)} "
         f"Preview: {repr(img_obj)[:200]}"
@@ -150,7 +192,6 @@ def save_stream_image_to_disk(img_obj, tmp_dir: str) -> str:
 # ============================================================
 
 def load_domain_jsonl(path: str):
-    """Load your patent style JSONL into a list of dicts."""
     data = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
@@ -167,7 +208,7 @@ def sample_domain_data(
     exclude_logo: bool = True,
 ):
     """
-    Load domain JSONL, filter artefact_type == "logo" if requested,
+    Load domain JSONL, filter artefact_type == 'logo' if requested,
     then random sample up to max_domain_samples.
     """
     domain = load_domain_jsonl(jsonl_path)
@@ -182,7 +223,6 @@ def sample_domain_data(
     if max_domain_samples is not None and max_domain_samples > 0:
         domain = domain[:max_domain_samples]
 
-    # Normalize to common schema
     normalized = []
     for ex in domain:
         normalized.append(
@@ -205,59 +245,40 @@ def sample_domain_data(
 
 
 # ============================================================
-# 3. FineVision general data: streaming and sampling
+# 3. FineVision general data: subset weighted sampling
 # ============================================================
 
 def adapt_finevision_example(ex) -> dict:
     """
     Map one FineVision example to the common schema.
-
-    FineVision schema often has:
-    - "images": list of images
-    - "texts": list of text turns or captions
-    - rating fields
-
-    We try:
-    1. Use explicit "question"/"query"/"answer"/"answers" when present.
-    2. If not present, use "texts" to synthesize:
-       - if len(texts) >= 2: first text as question, second as answer
-       - if len(texts) == 1: generic question, text as answer
-    3. Use the first element of "images" as the image.
     """
 
-    # Try standard QA fields
     question = ex.get("question") or ex.get("query") or ""
     context = ex.get("context") or ""
     answer = ex.get("answer")
     if answer is None and isinstance(ex.get("answers"), list) and ex["answers"]:
         answer = ex["answers"][0]
 
-    # Fallback to "texts" if no question or answer
     if not question or answer is None:
         texts = ex.get("texts")
         if isinstance(texts, list) and len(texts) >= 2:
-            # Treat as Q A pair
             if not question:
                 question = texts[0]
             if answer is None:
                 answer = texts[1]
         elif isinstance(texts, list) and len(texts) == 1:
-            # One caption only
             if not question:
                 question = "Describe the image in detail."
             if answer is None:
                 answer = texts[0]
 
-    # If still empty, skip this example
     if not question:
         raise KeyError(
             f"No usable question or texts in FineVision example. Keys: {list(ex.keys())}"
         )
     if answer is None:
-        # Allow empty string as answer if needed
         answer = ""
 
-    # Try to find an image-like field
     img_obj = None
     if "image" in ex:
         img_obj = ex["image"]
@@ -292,30 +313,65 @@ def adapt_finevision_example(ex) -> dict:
 def sample_finevision_general(
     tmp_image_dir: str,
     total_general_samples: int,
-    subsets=None,
-):
+    subset_weights: Dict[str, float],
+    subsets: Optional[List[str]] = None,
+) -> List[dict]:
     """
-    Stream from huggingface-m4/finevision for given subsets.
-    Sample up to total_general_samples in total across subsets.
-    For each example, dump image to disk and store path.
+    Stage 2 general sampling with subset proportions.
 
-    Robust to schema differences:
-    - Skips examples that raise KeyError in adapt_finevision_example.
+    - Use subset_weights to decide how many samples per subset.
+    - Sample from each subset via HF streaming.
     """
 
-    from math import ceil
+    if total_general_samples <= 0:
+        return []
 
     if subsets is None:
         subsets = RECOMMENDED_FINEVISION_SUBSETS
 
-    per_subset = max(1, ceil(total_general_samples / max(1, len(subsets))))
-    all_samples = []
+    # Active subsets = intersection of requested subsets and weight keys
+    active_subsets = [s for s in subsets if s in subset_weights]
+    if not active_subsets:
+        raise ValueError("No active subsets found in subset_weights.")
 
-    for subset_name in subsets:
+    # Normalise weights
+    weight_sum = sum(subset_weights[s] for s in active_subsets)
+    if weight_sum <= 0:
+        raise ValueError("Sum of subset_weights must be positive.")
+
+    norm_weights = {s: subset_weights[s] / weight_sum for s in active_subsets}
+
+    # Compute exact quotas and floor
+    raw_targets: List[Tuple[str, float]] = []
+    for s in active_subsets:
+        exact = total_general_samples * norm_weights[s]
+        raw_targets.append((s, exact))
+
+    per_subset_targets: Dict[str, int] = {}
+    total_floor = 0
+    frac_parts: List[Tuple[str, float]] = []
+    for s, exact in raw_targets:
+        base = int(exact)
+        per_subset_targets[s] = base
+        total_floor += base
+        frac_parts.append((s, exact - base))
+
+    remainder = total_general_samples - total_floor
+    frac_parts.sort(key=lambda x: x[1], reverse=True)
+    for i in range(remainder):
+        s, _ = frac_parts[i]
+        per_subset_targets[s] += 1
+
+    all_samples: List[dict] = []
+
+    for subset_name in active_subsets:
+        subset_quota = per_subset_targets[subset_name]
+        if subset_quota <= 0:
+            continue
         if len(all_samples) >= total_general_samples:
             break
 
-        print(f"Streaming FineVision subset: {subset_name}")
+        print(f"Streaming FineVision subset: {subset_name} (quota: {subset_quota})")
         ds_stream = load_dataset(
             "HuggingFaceM4/FineVision",
             subset_name,
@@ -325,13 +381,12 @@ def sample_finevision_general(
 
         count = 0
         for ex in ds_stream:
-            if count >= per_subset or len(all_samples) >= total_general_samples:
+            if count >= subset_quota or len(all_samples) >= total_general_samples:
                 break
 
             try:
                 adapted = adapt_finevision_example(ex)
             except KeyError:
-                # Example has no usable image or texts, skip
                 continue
 
             img_obj = adapted.pop("image_obj", None)
@@ -345,8 +400,7 @@ def sample_finevision_general(
 
     if not all_samples:
         raise ValueError(
-            "No general FineVision samples collected. "
-            "Check subset names or schema."
+            "No general FineVision samples collected. Check subset names or schema."
         )
 
     random.shuffle(all_samples)
@@ -363,8 +417,8 @@ def sample_finevision_general(
 def build_messages_from_example(ex: dict) -> dict:
     """
     Convert normalized example to Unsloth chat messages format.
-    Use image path string directly. Unsloth will load it.
     """
+
     instruction = (
         "You are a chemistry and scientific vision expert. "
         "You look at tables, figures and other images and "
@@ -410,53 +464,44 @@ def split_train_val(examples, val_ratio: float, seed: int = 42):
     return train, val
 
 
-def prepare_mixed_dataset(
-    domain_jsonl: str,
-    max_domain_samples: int,
-    total_general_samples: int,
-    tmp_image_dir: str,
-    val_ratio: float = 0.1,
-):
+def interleave_domain_and_general(domain, general, domain_prob: Optional[float] = None, seed: int = 42):
     """
-    Full data preparation:
-
-    1. Domain JSONL to filter logos and sample.
-    2. FineVision streaming to sample general data.
-    3. Mix and split.
-    4. Build messages dataset for Unsloth training.
-    5. Also keep raw val examples for inference and judge.
+    For each position, choose domain with probability domain_prob,
+    otherwise choose general.
     """
-    # Domain
-    domain_examples = sample_domain_data(
-        jsonl_path=domain_jsonl,
-        max_domain_samples=max_domain_samples,
-        exclude_logo=True,
-    )
-    print(f"Domain examples after filter and sample: {len(domain_examples)}")
 
-    # General
-    general_examples = []
-    if total_general_samples > 0:
-        general_examples = sample_finevision_general(
-            tmp_image_dir=tmp_image_dir,
-            total_general_samples=total_general_samples,
-            subsets=RECOMMENDED_FINEVISION_SUBSETS,
-        )
-    print(f"General FineVision examples: {len(general_examples)}")
+    rng = random.Random(seed)
 
-    # Mix and split
-    all_examples = domain_examples + general_examples
-    print(f"Total mixed examples: {len(all_examples)}")
+    domain = list(domain)
+    general = list(general)
+    rng.shuffle(domain)
+    rng.shuffle(general)
 
-    train_raw, val_raw = split_train_val(all_examples, val_ratio=val_ratio, seed=42)
-    print(f"Train size: {len(train_raw)}, Val size: {len(val_raw)}")
+    total = len(domain) + len(general)
+    if total == 0:
+        return []
 
-    # Convert to messages
-    print("Converting to messages format for Unsloth...")
-    train_msgs = [build_messages_from_example(ex) for ex in tqdm(train_raw)]
-    val_msgs = [build_messages_from_example(ex) for ex in tqdm(val_raw)]
+    if domain_prob is None:
+        domain_prob = len(domain) / float(total)
 
-    return train_msgs, val_msgs, val_raw
+    i_dom = 0
+    i_gen = 0
+    mixed = []
+
+    while i_dom < len(domain) and i_gen < len(general):
+        if rng.random() < domain_prob:
+            mixed.append(domain[i_dom])
+            i_dom += 1
+        else:
+            mixed.append(general[i_gen])
+            i_gen += 1
+
+    if i_dom < len(domain):
+        mixed.extend(domain[i_dom:])
+    if i_gen < len(general):
+        mixed.extend(general[i_gen:])
+
+    return mixed
 
 
 # ============================================================
@@ -529,7 +574,6 @@ def train(model, tokenizer, train_ds, val_ds, output, epochs):
 # ============================================================
 
 def build_inference_messages(ex: dict):
-    """User only messages for generation."""
     instruction = (
         "You are a chemistry and scientific vision expert. "
         "You look at tables, figures and other images and "
@@ -604,33 +648,16 @@ def run_inference(model, tokenizer, val_raw, output_path, max_new_tokens=128):
 # ============================================================
 
 def judge_with_braintrust(results, cocktail_path, sample_limit=None):
-    """
-    Use gpt-5 through Braintrust proxy to judge predictions.
-
-    Needs:
-    - BRAINTRUST_BASE_URL
-    - BRAINTRUST_API_KEY
-
-    Judge sees:
-    - question
-    - context
-    - model answer
-    - image path
-
-    It does not see or trust the gold label. Gold answer is only stored in the record.
-    """
-    from dotenv import load_dotenv
-    load_dotenv()
     if OpenAI is None:
         print("openai library not installed. Skip judge.")
-        return []
-    
+        return [], None
+
     base_url = os.environ.get("BRAINTRUST_BASE_URL")
     api_key = os.environ.get("BRAINTRUST_API_KEY")
 
     if not base_url or not api_key:
         print("Braintrust env vars not set. Skip judge.")
-        return []
+        return [], None
 
     client = OpenAI(base_url=base_url, api_key=api_key)
 
@@ -684,7 +711,7 @@ def judge_with_braintrust(results, cocktail_path, sample_limit=None):
     if avg_score is not None:
         print(f"Average judge score: {avg_score:.3f}")
 
-    return judged
+    return judged, avg_score
 
 
 # ============================================================
@@ -692,11 +719,6 @@ def judge_with_braintrust(results, cocktail_path, sample_limit=None):
 # ============================================================
 
 def recommend_highest_score(judged_results, output_path: str):
-    """
-    Given a list of results containing judge_score,
-    find the sample with the highest score and save it as a JSON file.
-    If there are ties, take the first one.
-    """
     valid = [r for r in judged_results if isinstance(r.get("judge_score"), (int, float))]
 
     if not valid:
@@ -716,7 +738,144 @@ def recommend_highest_score(judged_results, output_path: str):
 
 
 # ============================================================
-# 9. CLI
+# 9. Automatic 2D grid search over (domain_ratio, subset_weights)
+# ============================================================
+
+def run_grid_search(args):
+    """
+    For each domain_ratio in DOMAIN_RATIO_GRID
+    and each subset_weights config in SUBSET_WEIGHT_GRID:
+
+        Stage 1:
+            - Compute G from D and domain_ratio.
+            - Clamp by general_samples if > 0.
+
+        Stage 2:
+            - Sample G general examples from FineVision
+              according to subset_weights.
+
+        Then:
+            - Interleave domain and general using domain_ratio.
+            - Train, infer, judge.
+            - Track best configuration by judge score.
+    """
+
+    # Sample domain once
+    domain_examples = sample_domain_data(
+        jsonl_path=args.domain_data,
+        max_domain_samples=args.max_domain_samples,
+        exclude_logo=True,
+    )
+    D = len(domain_examples)
+    print(f"[grid] Domain examples after filter and sample: {D}")
+
+    if D == 0:
+        raise ValueError("No domain examples found after filtering.")
+
+    if not args.run_judge:
+        print("Grid search requires --run_judge to compare models.")
+        return
+
+    best_score = None
+    best_config = None
+    best_output = None
+
+    grid_results = []
+
+    for domain_prob in DOMAIN_RATIO_GRID:
+        # Stage 1: compute G from ratio
+        G_raw = D * (1.0 - domain_prob) / domain_prob
+        G_target = int(round(G_raw))
+
+        if args.general_samples is not None and args.general_samples > 0:
+            G_target = min(G_target, args.general_samples)
+
+        print(f"\n=== Domain ratio {domain_prob:.2f}, target general G = {G_target} ===")
+
+        for subset_idx, subset_weights in enumerate(SUBSET_WEIGHT_GRID):
+            print(f"\n--- Subset weight config {subset_idx} ---")
+
+            run_tag = f"dp{int(domain_prob * 100)}_sw{subset_idx}"
+            run_output = f"{args.output}_{run_tag}"
+            os.makedirs(run_output, exist_ok=True)
+
+            print(f"[grid] Sampling general data for {run_tag} ...")
+            general_examples = sample_finevision_general(
+                tmp_image_dir=args.tmp_image_dir,
+                total_general_samples=G_target,
+                subset_weights=subset_weights,
+                subsets=RECOMMENDED_FINEVISION_SUBSETS,
+            )
+            print(f"[grid] Collected general examples: {len(general_examples)}")
+
+            all_examples = interleave_domain_and_general(
+                domain_examples,
+                general_examples,
+                domain_prob=domain_prob,
+                seed=42,
+            )
+            print(f"[grid] Total mixed examples: {len(all_examples)}")
+
+            train_raw, val_raw = split_train_val(all_examples, val_ratio=args.val_ratio, seed=42)
+            print(f"[grid] Train size: {len(train_raw)}, Val size: {len(val_raw)}")
+
+            print("[grid] Converting to messages format...")
+            train_msgs = [build_messages_from_example(ex) for ex in tqdm(train_raw)]
+            val_msgs = [build_messages_from_example(ex) for ex in tqdm(val_raw)]
+
+            model, tok = load_model(args.model)
+            train(model, tok, train_msgs, val_msgs, run_output, args.epochs)
+
+            infer_path = os.path.join(run_output, "val_predictions.jsonl")
+            results = run_inference(model, tok, val_raw, infer_path)
+
+            cocktail_path = os.path.join(run_output, "data_cocktail_with_judge.jsonl")
+            judged, avg_score = judge_with_braintrust(
+                results,
+                cocktail_path,
+                sample_limit=args.judge_sample_limit,
+            )
+
+            recommended_path = os.path.join(run_output, "recommended_sample.json")
+            recommend_highest_score(judged, recommended_path)
+
+            config_info = {
+                "domain_ratio": domain_prob,
+                "subset_index": subset_idx,
+                "subset_weights": subset_weights,
+                "G_target": G_target,
+                "checkpoint_dir": run_output,
+                "avg_score": avg_score,
+            }
+            grid_results.append(config_info)
+
+            print(f"[grid] Config {run_tag} avg_score = {avg_score}")
+
+            if avg_score is None:
+                continue
+
+            if best_score is None or avg_score > best_score:
+                best_score = avg_score
+                best_config = config_info
+                best_output = run_output
+
+    # Save grid search summary
+    summary_path = f"{args.output}_grid_summary.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(grid_results, f, ensure_ascii=False, indent=2)
+    print(f"\nSaved grid search summary to {summary_path}")
+
+    print("\n===== Grid search finished =====")
+    if best_config is None:
+        print("Could not determine a best configuration.")
+    else:
+        print("Best configuration:")
+        print(json.dumps(best_config, ensure_ascii=False, indent=2))
+        print(f"Best checkpoint folder: {best_output}")
+
+
+# ============================================================
+# 10. CLI and main
 # ============================================================
 
 def parse_args():
@@ -724,13 +883,19 @@ def parse_args():
 
     p.add_argument("--domain_data", required=True, help="Path to domain JSONL (your schema).")
     p.add_argument("--max_domain_samples", type=int, default=9500, help="Max domain samples.")
-    p.add_argument("--general_samples", type=int, default=2000, help="Total FineVision general samples.")
+    p.add_argument(
+        "--general_samples",
+        type=int,
+        default=0,
+        help="Optional cap on total general (FineVision) samples. "
+             "If 0, use full G = D*(1-p)/p."
+    )
     p.add_argument("--tmp_image_dir", default="tmp_images", help="Folder to store streamed images.")
-    p.add_argument("--output", default="mixed_finetuned", help="Model output directory.")
+    p.add_argument("--output", default="mixed_finetuned", help="Base model output directory.")
     p.add_argument("--epochs", type=int, default=2)
     p.add_argument("--model", default="unsloth/Qwen3-VL-8B-Instruct")
     p.add_argument("--val_ratio", type=float, default=0.1)
-    p.add_argument("--run_judge", action="store_true", help="If set, run LLM judge.")
+    p.add_argument("--run_judge", action="store_true", help="If set, run LLM judge and grid search.")
     p.add_argument("--judge_sample_limit", type=int, default=100, help="Max samples to send to judge.")
 
     return p.parse_args()
@@ -738,37 +903,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-
-    # 1. Data
-    train_msgs, val_msgs, val_raw = prepare_mixed_dataset(
-        domain_jsonl=args.domain_data,
-        max_domain_samples=args.max_domain_samples,
-        total_general_samples=args.general_samples,
-        tmp_image_dir=args.tmp_image_dir,
-        val_ratio=args.val_ratio,
-    )
-
-    # 2. Model
-    model, tok = load_model(args.model)
-
-    # 3. Train
-    train(model, tok, train_msgs, val_msgs, args.output, args.epochs)
-
-    # 4. Inference on val set
-    infer_path = os.path.join(args.output, "val_predictions.jsonl")
-    results = run_inference(model, tok, val_raw, infer_path)
-
-    # 5. Judge and cocktail plus recommendation
-    if args.run_judge:
-        cocktail_path = os.path.join(args.output, "data_cocktail_with_judge.jsonl")
-        judged = judge_with_braintrust(
-            results,
-            cocktail_path,
-            sample_limit=args.judge_sample_limit,
-        )
-
-        recommended_path = os.path.join(args.output, "recommended_sample.json")
-        recommend_highest_score(judged, recommended_path)
+    run_grid_search(args)
 
 
 if __name__ == "__main__":
