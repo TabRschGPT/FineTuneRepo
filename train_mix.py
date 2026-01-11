@@ -10,6 +10,11 @@
 # - Does NOT save FineVision images to disk
 # - Does NOT cache images in memory (each sample loads and yields a PIL image)
 #
+# Key robustness fixes
+# 1) Count domain samples ONLY if images can be opened (prevents StopIteration).
+# 2) FineVision subset iterator loops until it hits quota (or fails fast with clear error).
+# 3) Mixture generator guards against iterator exhaustion with clear RuntimeError.
+#
 # Requirements
 # - pip install datasets pillow torch trl unsloth huggingface_hub
 # - huggingface-cli login (if pulling gated or pushing)
@@ -23,21 +28,19 @@
 
 import os
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"  # disable Unsloth auto compiler
 
 import argparse
+import gc
 import io
 import json
 import math
 import random
-import uuid
-import gc
-import re
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 import torch
 from PIL import Image as PILImage
-
 from datasets import load_dataset, IterableDataset
 
 from unsloth import FastVisionModel
@@ -136,7 +139,8 @@ def resolve_domain_image_path(domain_jsonl_path: str, img_path: str) -> str:
 
 def count_domain_samples(domain_jsonl_path: str, include_logo: bool) -> int:
     """
-    Counts valid domain samples (to compute G). Reads the jsonl once.
+    Counts usable domain samples (image can be opened).
+    Prevents StopIteration later when domain_iterator skips invalid rows.
     """
     n = 0
     with open(domain_jsonl_path, "r", encoding="utf-8") as f:
@@ -146,7 +150,17 @@ def count_domain_samples(domain_jsonl_path: str, include_logo: bool) -> int:
             x = json.loads(line)
             if (not include_logo) and (x.get("artefact_type") == "logo"):
                 continue
-            n += 1
+
+            img_rel = str(x.get("file", "")).strip()
+            if not img_rel:
+                continue
+            img_path = resolve_domain_image_path(domain_jsonl_path, img_rel)
+
+            try:
+                _ = to_pil_rgb(img_path)
+                n += 1
+            except Exception:
+                continue
     return n
 
 
@@ -156,12 +170,12 @@ def domain_iterator(
     seed: int,
 ) -> Iterator[dict]:
     """
-    Streams domain data from JSONL. No shuffling across whole file.
+    Streams domain data from JSONL.
     For a "good enough" shuffle, we do small-buffer shuffle.
     """
     rng = random.Random(seed)
     buf: List[dict] = []
-    BUF_SIZE = 256  # small shuffle buffer
+    BUF_SIZE = 256
 
     with open(domain_jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
@@ -171,7 +185,11 @@ def domain_iterator(
             if (not include_logo) and (x.get("artefact_type") == "logo"):
                 continue
 
-            img_path = resolve_domain_image_path(domain_jsonl_path, x["file"])
+            img_rel = str(x.get("file", "")).strip()
+            if not img_rel:
+                continue
+            img_path = resolve_domain_image_path(domain_jsonl_path, img_rel)
+
             try:
                 img = to_pil_rgb(img_path)
             except Exception:
@@ -252,36 +270,47 @@ def allocate_quotas(total_n: int, weights: Dict[str, float]) -> Dict[str, int]:
 def finevision_subset_iterator(subset: str, quota: int, seed: int) -> Iterator[dict]:
     """
     Streams a single FineVision subset until quota items are produced.
+    Loops over the stream again if needed, and fails fast if no progress is possible.
     """
     if quota <= 0:
         return
-        yield  # to make it a generator
+        yield
 
     ds = load_dataset(
         FINEVISION_DATASET_ID,
         subset,
         split="train",
         streaming=True,
-    )
+    ).shuffle(buffer_size=10_000, seed=seed)
 
     got = 0
-    for ex in ds:
-        if got >= quota:
-            break
-        try:
-            q, a, img_obj = adapt_fv(ex)
-            img = to_pil_rgb(img_obj)
-            yield {
-                "source": "general",
-                "question": q,
-                "context": "",
-                "answer": a,
-                "rationale": "",
-                "image": img,  # PIL
-            }
-            got += 1
-        except Exception:
-            continue
+    while got < quota:
+        progressed = False
+
+        for ex in ds:
+            if got >= quota:
+                break
+            try:
+                q, a, img_obj = adapt_fv(ex)
+                img = to_pil_rgb(img_obj)
+                yield {
+                    "source": "general",
+                    "question": q,
+                    "context": "",
+                    "answer": a,
+                    "rationale": "",
+                    "image": img,  # PIL
+                }
+                got += 1
+                progressed = True
+            except Exception:
+                continue
+
+        if not progressed:
+            raise RuntimeError(
+                f"FineVision subset '{subset}' could not provide more valid samples. "
+                f"Produced {got}/{quota}. Check subset name or streaming access."
+            )
 
 
 def finevision_iterator(
@@ -296,7 +325,6 @@ def finevision_iterator(
     weights = normalize_weights(weights)
     quotas = allocate_quotas(total_n, weights)
 
-    # To avoid always starting from same subset, shuffle subset order
     subsets = list(quotas.keys())
     rng.shuffle(subsets)
 
@@ -339,7 +367,7 @@ def build_messages(ex: dict) -> dict:
 
 
 # ==========================
-# Mixture generator with exact counts
+# Mixture generator with exact counts + guards
 # ==========================
 def mixture_generator(
     domain_jsonl_path: str,
@@ -363,24 +391,47 @@ def mixture_generator(
 
     while remD > 0 or remG > 0:
         if remD == 0:
-            x = next(gen_it)
+            try:
+                x = next(gen_it)
+            except StopIteration:
+                raise RuntimeError(
+                    "General (FineVision) iterator exhausted early. "
+                    "This usually means quotas could not be satisfied due to filtering/errors."
+                )
             remG -= 1
             yield build_messages(x)
             continue
 
         if remG == 0:
-            x = next(dom_it)
+            try:
+                x = next(dom_it)
+            except StopIteration:
+                raise RuntimeError(
+                    "Domain iterator exhausted early. "
+                    "This usually means your domain JSONL has too many invalid/missing images."
+                )
             remD -= 1
             yield build_messages(x)
             continue
 
-        # choose domain with probability remD/(remD+remG)
         if rng.random() < (remD / float(remD + remG)):
-            x = next(dom_it)
+            try:
+                x = next(dom_it)
+            except StopIteration:
+                raise RuntimeError(
+                    "Domain iterator exhausted early. "
+                    "Your counted domain_count was too high versus loadable images."
+                )
             remD -= 1
             yield build_messages(x)
         else:
-            x = next(gen_it)
+            try:
+                x = next(gen_it)
+            except StopIteration:
+                raise RuntimeError(
+                    "General (FineVision) iterator exhausted early. "
+                    "Your general_count/quota was too high versus valid samples."
+                )
             remG -= 1
             yield build_messages(x)
 
@@ -395,12 +446,11 @@ def load_best_params(best_params_json: str) -> Tuple[float, Dict[str, float]]:
 
     domain_ratio = float(best["domain_ratio"])
 
-    weights = {}
+    weights: Dict[str, float] = {}
     for k, v in best.items():
         if k.startswith("w_"):
             weights[k[len("w_"):]] = float(v)
 
-    # ensure all known subsets exist, missing defaults to 0.0
     for s in DEFAULT_FINEVISION_SUBSETS:
         weights.setdefault(s, 0.0)
 
@@ -414,11 +464,11 @@ def main():
     p = argparse.ArgumentParser()
 
     # data
-    p.add_argument("--domain_data", required=True)
+    p.add_argument("--domain_data", default="final_train_normalized.jsonl")
     p.add_argument("--include_logo", action="store_true")
 
     # best params
-    p.add_argument("--best_params_json", required=True)
+    p.add_argument("--best_params_json", default="best_params.json")
 
     # training
     p.add_argument("--model", default="unsloth/Qwen3-VL-8B-Instruct-unsloth-bnb-4bit")
@@ -433,6 +483,7 @@ def main():
     # misc
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--report_to", default="wandb")  # set "none" to disable
+    p.add_argument("--device_map", default="auto")  # "auto" recommended; or {"":0}
 
     args = p.parse_args()
     random.seed(args.seed)
@@ -440,21 +491,19 @@ def main():
 
     # Load best params
     domain_ratio, weights = load_best_params(args.best_params_json)
-
     if not (0.0 < domain_ratio < 1.0):
         raise ValueError("domain_ratio must be between 0 and 1")
 
-    # Count domain to compute general
+    # Count domain samples that are actually usable
     D = count_domain_samples(args.domain_data, include_logo=args.include_logo)
     if D <= 0:
-        raise ValueError("Domain dataset is empty after filtering.")
+        raise ValueError("Domain dataset is empty after filtering / image load checks.")
 
     # G = D*(1-r)/r
     G = int(round(D * (1.0 - domain_ratio) / domain_ratio))
     total_samples = D + G
 
-    # Compute training steps for IterableDataset
-    # each step consumes (bs * grad_accum) samples effectively per optimizer update
+    # Compute steps for streaming dataset
     samples_per_update = max(1, int(args.bs) * int(args.grad_accum))
     updates_per_epoch = int(math.ceil(total_samples / float(samples_per_update)))
     max_steps = int(updates_per_epoch * int(args.epochs))
@@ -480,19 +529,23 @@ def main():
         "weights": weights,
         "include_logo": args.include_logo,
         "seed": args.seed,
+        "model": args.model,
+        "device_map": args.device_map,
     }
     with open(os.path.join(args.output_dir, "resolved_stream_mix_config.json"), "w", encoding="utf-8") as f:
         json.dump(resolved, f, indent=2)
 
     # Build streaming dataset
-    gen_fn = lambda: mixture_generator(
-        domain_jsonl_path=args.domain_data,
-        include_logo=args.include_logo,
-        domain_count=D,
-        general_count=G,
-        general_weights=weights,
-        seed=args.seed,
-    )
+    def gen_fn():
+        return mixture_generator(
+            domain_jsonl_path=args.domain_data,
+            include_logo=args.include_logo,
+            domain_count=D,
+            general_count=G,
+            general_weights=weights,
+            seed=args.seed,
+        )
+
     train_ds = IterableDataset.from_generator(gen_fn)
 
     # Load model
@@ -500,7 +553,7 @@ def main():
         args.model,
         max_seq_length=MODEL_MAX_SEQ_LENGTH,
         load_in_4bit=True,
-        device_map={"": 0},
+        device_map=args.device_map,
         use_gradient_checkpointing="unsloth",
     )
 
@@ -508,7 +561,7 @@ def main():
     if tok.pad_token_id is None:
         tok.pad_token = tok.eos_token
 
-    # LoRA (defaults are fine, tune if needed)
+    # LoRA
     model = FastVisionModel.get_peft_model(
         model,
         r=8,
