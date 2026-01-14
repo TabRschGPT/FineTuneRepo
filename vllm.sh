@@ -21,9 +21,11 @@ export HOME=/workspace/work
 mkdir -p "$HF_HUB_CACHE" "$HF_MODULES_CACHE" "$TRANSFORMERS_CACHE" \
          "$HF_DATASETS_CACHE" "$VLLM_CACHE_DIR" "$MPLCONFIGDIR" "$TMPDIR"
 
-vllm serve /workspace/work/merged_qwen3vl_16bit \
-  --max-model-len 4096 \
+vllm serve unsloth/Qwen3-VL-8B-Instruct \
+  --max-model-len 8192 \
   --quantization bitsandbytes \
   --load-format bitsandbytes \
   --limit-mm-per-prompt '{"image":1}' \
-  --allowed-local-media-path /
+  --allowed-local-media-path /workspace/work \
+  --disable-mm-preprocessor-cache \
+  --max-num-seqs 1 
