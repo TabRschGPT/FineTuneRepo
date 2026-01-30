@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
-
+# CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch  train_mix.py   --domain_data final_train_normalized.jsonl   --output_dir ./output_logo_test   --epochs 1   --bs 1   --grad_accum 8   --lr 1e-10
 # ============================================================
 # QLoRA + BitsAndBytes + LLaVA-Med (MAP-STYLE DATASET)
 # ============================================================
