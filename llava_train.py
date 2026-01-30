@@ -2,24 +2,28 @@
 # coding: utf-8
 
 # ============================================================
-# LEGACY MODE: Transformers 4.37.x | TRL | LLaVA-Med
+# QLoRA + BitsAndBytes + LLaVA-Med (MAP-STYLE DATASET)
 # ============================================================
 
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["HF_DISABLE_CACHING_ALLOCATOR_WARMUP"] = "1"
 
 import argparse
-import io
 import json
-import math
 import random
 from pathlib import Path
 
 import torch
+from torch.utils.data import Dataset
 from PIL import Image
-from datasets import IterableDataset
 
-from transformers import AutoProcessor, AutoModelForVision2Seq, TrainingArguments
+from transformers import (
+    AutoProcessor,
+    AutoModelForVision2Seq,
+    TrainingArguments,
+    BitsAndBytesConfig,
+)
 from peft import LoraConfig, get_peft_model
 from trl import SFTTrainer
 
@@ -28,7 +32,8 @@ from trl import SFTTrainer
 # ============================================================
 
 MODEL_ID = "Eren-Senoglu/llava-med-v1.5-mistral-7b-hf"
-MAX_IMAGE_SIDE = 1024
+
+MAX_IMAGE_SIDE = 640          # SAFE
 MAX_SEQ_LEN = 2048
 
 PROMPT_STYLE = """You are an expert assistant.
@@ -59,41 +64,36 @@ def resolve_image_path(jsonl_path: str, img_path: str) -> str:
     base = Path(jsonl_path).parent.resolve()
     return str(base / img_path) if not os.path.isabs(img_path) else img_path
 
-def count_samples(jsonl_path: str) -> int:
-    with open(jsonl_path, "r", encoding="utf-8") as f:
-        return sum(1 for line in f if line.strip())
-
 # ============================================================
-# Dataset
+# Map-style Dataset
 # ============================================================
 
-def build_example(row, image):
-    prompt = PROMPT_STYLE.format(
-        question=row.get("question", ""),
-        context=row.get("context", ""),
-    )
-    return {
-        "image": image,
-        "prompt": prompt,
-        "answer": row.get("answer", ""),
-    }
-
-def dataset_generator(jsonl_path: str, seed: int, epochs: int):
-    rng = random.Random(seed)
-    for _ in range(epochs):
+class VisionJsonlDataset(Dataset):
+    def __init__(self, jsonl_path: str):
+        self.jsonl_path = jsonl_path
         with open(jsonl_path, "r", encoding="utf-8") as f:
-            rows = [json.loads(l) for l in f if l.strip()]
-        rng.shuffle(rows)
-        for row in rows:
-            if not row.get("file"):
-                continue
-            try:
-                image = load_image(
-                    resolve_image_path(jsonl_path, row["file"])
-                )
-            except Exception:
-                continue
-            yield build_example(row, image)
+            self.rows = [json.loads(l) for l in f if l.strip()]
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, idx):
+        row = self.rows[idx]
+
+        image = load_image(
+            resolve_image_path(self.jsonl_path, row["file"])
+        )
+
+        prompt = PROMPT_STYLE.format(
+            question=row.get("question", ""),
+            context=row.get("context", ""),
+        )
+
+        return {
+            "image": image,
+            "prompt": prompt,
+            "answer": row.get("answer", ""),
+        }
 
 # ============================================================
 # Collator
@@ -154,82 +154,83 @@ def main():
     random.seed(args.seed)
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
 
-    # ============================================================
-    # Compute max_steps (REQUIRED for IterableDataset)
-    # ============================================================
-    num_samples = count_samples(args.domain_data)
-    effective_bs = args.bs * args.grad_accum
-    max_steps = math.ceil(num_samples / effective_bs) * args.epochs
+    # ------------------------------------------------------------
+    # Dataset
+    # ------------------------------------------------------------
+    train_ds = VisionJsonlDataset(args.domain_data)
 
-    print(f"Samples: {num_samples}")
-    print(f"Max steps: {max_steps}")
-
-    train_ds = IterableDataset.from_generator(
-        lambda: dataset_generator(
-            args.domain_data, args.seed, args.epochs
-        )
-    )
-
-    # ============================================================
-    # Load processor + PATCH
-    # ============================================================
-    print(f"Loading processor: {MODEL_ID}")
+    # ------------------------------------------------------------
+    # Processor
+    # ------------------------------------------------------------
     processor = AutoProcessor.from_pretrained(
         MODEL_ID, trust_remote_code=True
     )
 
-    # 🔥 THE ONLY PATCH THAT MATTERS
     processor.patch_size = 14
-    assert processor.patch_size == 14
-
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-    # ============================================================
-    # Load model
-    # ============================================================
-    print("Loading model")
+    # ------------------------------------------------------------
+    # BitsAndBytes (4-bit QLoRA)
+    # ------------------------------------------------------------
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+    )
+
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    device_map = {"": local_rank}
+
+    print("Loading model (bnb 4-bit)")
     model = AutoModelForVision2Seq.from_pretrained(
         MODEL_ID,
-        load_in_4bit=True,
+        quantization_config=bnb_config,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        low_cpu_mem_usage=True,
+        device_map=device_map,
         trust_remote_code=True,
     )
 
-    model.gradient_checkpointing_enable()
-    model.enable_input_require_grads()
+    # ------------------------------------------------------------
+    # Memory Savers
+    # ------------------------------------------------------------
+    model.vision_tower.requires_grad_(False)
+    # model.gradient_checkpointing_enable()
+    # model.enable_input_require_grads()
 
+    torch.cuda.empty_cache()
+
+    # ------------------------------------------------------------
+    # LoRA (SAFE)
+    # ------------------------------------------------------------
     model = get_peft_model(
         model,
         LoraConfig(
-            r=16,
-            lora_alpha=32,
+            r=8,
+            lora_alpha=16,
             lora_dropout=0.05,
             bias="none",
             task_type="CAUSAL_LM",
-            target_modules=[
-                "q_proj", "k_proj", "v_proj", "o_proj",
-                "gate_proj", "up_proj", "down_proj",
-            ],
+            target_modules=["q_proj", "v_proj"],
         ),
     )
 
-    # ============================================================
-    # Trainer
-    # ============================================================
+    # ------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=args.bs,
         gradient_accumulation_steps=args.grad_accum,
         learning_rate=args.lr,
-        max_steps=max_steps,
+        num_train_epochs=args.epochs,
         logging_steps=10,
         save_steps=500,
         remove_unused_columns=False,
-        report_to="wandb",
-        fp16=False,
         bf16=True,
+        report_to="wandb",
     )
 
     trainer = SFTTrainer(
