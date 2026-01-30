@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 # coding: utf-8
-# CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch  train_mix.py   --domain_data final_train_normalized.jsonl   --output_dir ./output_logo_test   --epochs 1   --bs 1   --grad_accum 8   --lr 1e-10
+# CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch  train_mix.py   --domain_data final_train_normalized.jsonl   --output_dir ./output_logo_test   --epochs 1   --bs 1   --grad_accum 8   --lr 1e-4
 # ============================================================
 # QLoRA + BitsAndBytes + LLaVA-Med (MAP-STYLE DATASET)
 # ============================================================
@@ -231,6 +231,14 @@ def main():
         remove_unused_columns=False,
         bf16=True,
         report_to="wandb",
+        # 🔴 OPTIMIZER FIX (Karpathy-style AdamW)
+        optim="adamw_torch",
+        adam_beta1=0.9,
+        adam_beta2=0.95,
+        adam_epsilon=1e-10,
+    
+        # 🔴 IMPORTANT: avoid LR decay hiding learning
+        lr_scheduler_type="constant",
     )
 
     trainer = SFTTrainer(
