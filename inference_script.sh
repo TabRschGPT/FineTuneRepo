@@ -45,7 +45,7 @@ start_vllm () {
       --port "${VLLM_PORT}" \
       --trust-remote-code \
       --quantization bitsandbytes \
-      --max-model-len 1024 \
+      --max-model-len 5000 \
       --gpu-memory-utilization 0.90 \
       > "vllm_${model_name}.log" 2>&1 &
 
@@ -59,7 +59,7 @@ start_vllm () {
       --quantization bitsandbytes \
       --max-loras 4 \
       --max-lora-rank 64 \
-      --max-model-len 1024 \
+      --max-model-len 5000 \
       --gpu-memory-utilization 0.97 \
       > "vllm_${model_name}.log" 2>&1 &
   fi
