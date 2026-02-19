@@ -307,6 +307,7 @@ class DualModelManager:
             cfg.base_model,
             load_in_4bit=True,
             use_gradient_checkpointing="unsloth",
+            fast_inference = True
         )
 
         self.gen_path = Path(cfg.out_dir) / "generator_adapter"
@@ -626,11 +627,11 @@ def main():
     p.add_argument("--domain_data", required=True,
                    help="Path to JSONL with fields: question, context, answer, file")
     p.add_argument("--iterations_k", type=int, default=3)
-    p.add_argument("--step_size_j", type=int, default=500)
+    p.add_argument("--step_size_j", type=int, default=5000)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--base_model", default="unsloth/Qwen3-VL-8B-Instruct")
     p.add_argument("--max_seq_length", type=int, default=2048)
-    p.add_argument("--learning_rate", type=float, default=2e-4)
+    p.add_argument("--learning_rate", type=float, default=3e-4)
     p.add_argument("--epochs_per_iter", type=int, default=1)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--grad_accum", type=int, default=8)
