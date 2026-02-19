@@ -1,35 +1,18 @@
 #!/usr/bin/env python
-# coding: utf-8
-#
-# algo1_stream_seed_no_save.py
-#
-# What this script does
-# - Uses a streaming mixture as "seed data" (domain JSONL + FineVision subsets)
-# - Randomly interleaves domain and general samples to match domain_ratio
-# - Does NOT save images to disk
-# - Keeps images as PIL in-memory for each iteration batch
-# - Runs Algorithm-1 loop:
-#     (1) Generator (MG) generates candidate answers with <REASONING> and <SOLUTION>
-#     (2) Classifier (MC) validates candidate vs gold and outputs correct/incorrect
-#     (3) Fine-tunes generator and classifier adapters on the validated data
-#
-# Requirements
-# - pip install datasets pillow torch trl unsloth
-# - huggingface-cli login (if FineVision requires auth)
-#
-# Run example
-# python algo1_stream_seed_no_save.py \
-#   --domain_data /path/to/domain.jsonl \
-#   --best_params_json best_params.json \
-#   --output_dir algo1_outputs_stream \
-#   --iterations_k 3 \
-#   --step_size_j 500 \
-#   --epochs_per_iter 1
 
+# ==========================
+# ENV
+# ==========================
 import os
+
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["UNSLOTH_COMPILE_DISABLE"] = "1"
+os.environ["HF_HOME"] = "./hf_cache"
 
+# ==========================
+# IMPORTS
+# ==========================
 import argparse
 import gc
 import io
@@ -38,84 +21,52 @@ import random
 import re
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Dict, Iterator, List, Tuple, Any, Optional
+from typing import Dict, Iterator, List, Any, Optional
 
 import torch
 from PIL import Image as PILImage
 from tqdm import tqdm
-from datasets import load_dataset, Dataset, Features, Value
+
+from datasets import Dataset, Features, Value
 from datasets.features import Image as HFImage
 
 from unsloth import FastVisionModel
 from unsloth.trainer import UnslothVisionDataCollator
 from trl import SFTTrainer, SFTConfig
-
-
-# ==========================
-# Delimiters
-# ==========================
-REASONING_START = "<REASONING>"
-REASONING_END   = "</REASONING>"
-SOLUTION_START  = "<SOLUTION>"
-SOLUTION_END    = "</SOLUTION>"
-
+from peft import LoraConfig
 
 # ==========================
-# FineVision config
+# TOKENS
 # ==========================
-FINEVISION_DATASET_ID = "HuggingFaceM4/FineVision"
-
-DEFAULT_FINEVISION_SUBSETS = [
-    "CoSyn_400k_table",
-    "docvqa",
-    "pdfvqa",
-    "textvqa",
-    "chartqa",
-    "infographic_vqa",
-    "arxivqa",
-    "ai2d_merged",
-    "Unichart",
-    "LLaVA_Instruct_150K",
-]
+REASONING_START = "<reasoning>"
+REASONING_END = ""
+SOLUTION_START = "<solution>"
+SOLUTION_END = ""
 
 MAX_IMAGE_SIDE = 768
 
-
 # ==========================
-# Algo config
+# CONFIG
 # ==========================
 @dataclass
 class AlgoConfig:
     base_model: str = "unsloth/Qwen3-VL-8B-Instruct"
     iterations_k: int = 3
     step_size_j: int = 500
-
-    # LoRA adapter paths
-    gen_adapter_path: str = "checkpoints/generator_adapter"
-    cls_adapter_path: str = "checkpoints/classifier_adapter"
-
-    # Training hyperparameters
     max_seq_length: int = 2048
     learning_rate: float = 2e-4
     epochs_per_iter: int = 1
     batch_size: int = 1
     grad_accum: int = 8
     warmup_steps: int = 5
-
-    # Generation settings
     gen_max_new_tokens: int = 256
     cls_max_new_tokens: int = 16
-
-    # Seed mixture
-    include_logo: bool = True
     force_float_solution: bool = True
-
-    # Output
-    out_dir: str = "algo1_outputs_stream"
+    out_dir: str = "outputs"
 
 
 # ==========================
-# Image helpers (NO SAVE)
+# IMAGE HELPERS
 # ==========================
 def resize_if_needed(img: PILImage.Image) -> PILImage.Image:
     w, h = img.size
@@ -128,107 +79,59 @@ def resize_if_needed(img: PILImage.Image) -> PILImage.Image:
     return img.resize((nw, nh))
 
 
-def to_pil_rgb(img_obj) -> PILImage.Image:
-    """
-    Convert various HF image formats into PIL, without saving.
-    """
-    if isinstance(img_obj, PILImage.Image):
-        return resize_if_needed(img_obj.convert("RGB"))
-
-    if isinstance(img_obj, str):
-        return resize_if_needed(PILImage.open(img_obj).convert("RGB"))
-
-    if isinstance(img_obj, dict) and img_obj.get("bytes"):
-        return resize_if_needed(PILImage.open(io.BytesIO(img_obj["bytes"])).convert("RGB"))
-
-    if isinstance(img_obj, dict) and img_obj.get("path"):
-        return resize_if_needed(PILImage.open(img_obj["path"]).convert("RGB"))
-
-    if hasattr(img_obj, "to_pil"):
-        return resize_if_needed(img_obj.to_pil().convert("RGB"))
-
-    raise ValueError(f"Unsupported image format: {type(img_obj)}")
+def to_pil_rgb(x: Any) -> PILImage.Image:
+    if isinstance(x, PILImage.Image):
+        return resize_if_needed(x.convert("RGB"))
+    if isinstance(x, str):
+        return resize_if_needed(PILImage.open(x).convert("RGB"))
+    if isinstance(x, dict) and x.get("bytes"):
+        return resize_if_needed(
+            PILImage.open(io.BytesIO(x["bytes"])).convert("RGB")
+        )
+    if isinstance(x, dict) and x.get("path"):
+        return resize_if_needed(PILImage.open(x["path"]).convert("RGB"))
+    raise ValueError(f"Bad image input: {type(x)}")
 
 
 # ==========================
-# Domain streaming
+# DOMAIN STREAM
 # ==========================
-def resolve_domain_image_path(domain_jsonl_path: str, img_path: str) -> str:
-    base_dir = str(Path(domain_jsonl_path).parent.resolve())
-    if not os.path.isabs(img_path):
-        return os.path.join(base_dir, img_path)
-    return img_path
+def resolve_image(domain_jsonl: str, rel: str) -> str:
+    base = Path(domain_jsonl).parent
+    return rel if os.path.isabs(rel) else str(base / rel)
 
 
-def count_domain_samples(domain_jsonl_path: str, include_logo: bool) -> int:
-    """
-    Counts usable domain samples (image can be opened).
-    """
-    n = 0
-    with open(domain_jsonl_path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            x = json.loads(line)
-
-            if (not include_logo) and (x.get("artefact_type") == "logo"):
-                continue
-
-            img_rel = str(x.get("file", x.get("image", ""))).strip()
-            if not img_rel:
-                continue
-
-            img_path = resolve_domain_image_path(domain_jsonl_path, img_rel)
-            try:
-                _ = to_pil_rgb(img_path)
-                n += 1
-            except Exception:
-                continue
-    return n
-
-
-def domain_iterator(
-    domain_jsonl_path: str,
-    include_logo: bool,
-    seed: int,
-) -> Iterator[dict]:
-    """
-    Streams domain JSONL with small-buffer shuffle.
-    Yields records with PIL image.
-    """
+def domain_iterator(domain_jsonl: str, seed: int) -> Iterator[Dict]:
     rng = random.Random(seed)
-    buf: List[dict] = []
-    BUF_SIZE = 256
+    buf = []
 
-    with open(domain_jsonl_path, "r", encoding="utf-8") as f:
+    with open(domain_jsonl, "r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
-            x = json.loads(line)
 
-            if (not include_logo) and (x.get("artefact_type") == "logo"):
-                continue
+            x = json.loads(line)
 
             img_rel = str(x.get("file", x.get("image", ""))).strip()
             if not img_rel:
                 continue
 
-            img_path = resolve_domain_image_path(domain_jsonl_path, img_rel)
             try:
-                img = to_pil_rgb(img_path)
+                img = to_pil_rgb(resolve_image(domain_jsonl, img_rel))
             except Exception:
                 continue
 
-            rec = {
-                "source": "domain",
-                "question": str(x.get("question", "")).strip(),
-                "context": str(x.get("context", "")).strip(),
-                "answer": str(x.get("answer", "")).strip(),
-                "image": img,  # PIL
-            }
+            buf.append(
+                {
+                    "question": str(x.get("question", "")).strip(),
+                    "context": str(x.get("context", "")).strip(),
+                    "answer": str(x.get("answer", "")).strip(),
+                    "file": img_rel,
+                    "image": img,
+                }
+            )
 
-            buf.append(rec)
-            if len(buf) >= BUF_SIZE:
+            if len(buf) >= 256:
                 rng.shuffle(buf)
                 while buf:
                     yield buf.pop()
@@ -239,186 +142,161 @@ def domain_iterator(
 
 
 # ==========================
-# FineVision streaming (NO SAVE)
+# PARSING
 # ==========================
-def adapt_fv(ex) -> Tuple[str, str, object]:
-    q = ex.get("question") or ex.get("query") or "Describe the image."
-    a = ex.get("answer")
+_SOL_RE = re.compile(
+    re.escape(SOLUTION_START) + r"(.*?)" + re.escape(SOLUTION_END),
+    re.DOTALL,
+)
 
-    if a is None:
-        answers = ex.get("answers")
-        if isinstance(answers, list) and len(answers) > 0:
-            a = answers[0]
-    if a is None:
-        a = ""
-
-    img = ex.get("image") or ex.get("img")
-    if img is None:
-        imgs = ex.get("images")
-        if isinstance(imgs, list) and len(imgs) > 0:
-            img = imgs[0]
-    if img is None:
-        raise KeyError("No image field in FineVision sample")
-
-    return str(q), str(a), img
+_FLOAT_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
 
 
-def normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
-    s = float(sum(weights.values()))
-    if s <= 0:
-        n = len(weights)
-        return {k: 1.0 / n for k in weights}
-    return {k: float(v) / s for k, v in weights.items()}
+def extract_solution_block(text: str) -> Optional[str]:
+    m = _SOL_RE.search((text or "").strip())
+    if not m:
+        return None
+    return m.group(1).strip()
 
 
-def allocate_quotas(total_n: int, weights: Dict[str, float]) -> Dict[str, int]:
-    """
-    Largest-remainder allocation so quotas sum to total_n.
-    """
-    if total_n <= 0:
-        return {k: 0 for k in weights}
-
-    w = normalize_weights(weights)
-    raw = {k: total_n * v for k, v in w.items()}
-    base = {k: int(v) for k, v in raw.items()}
-    rem = total_n - sum(base.values())
-
-    frac = sorted(((k, raw[k] - base[k]) for k in raw), key=lambda x: x[1], reverse=True)
-    for i in range(rem):
-        base[frac[i][0]] += 1
-
-    return base
+def extract_single_float(text: str) -> Optional[str]:
+    m = _FLOAT_RE.search((text or "").strip())
+    if not m:
+        return None
+    return m.group(0)
 
 
-def finevision_subset_iterator(subset: str, quota: int, seed: int) -> Iterator[dict]:
-    """
-    Streams a FineVision subset until quota items are produced.
-    """
-    if quota <= 0:
-        return
-        yield
-
-    ds = load_dataset(
-        FINEVISION_DATASET_ID,
-        subset,
-        split="train",
-        streaming=True,
-    ).shuffle(buffer_size=10_000, seed=seed)
-
-    got = 0
-    while got < quota:
-        progressed = False
-        for ex in ds:
-            if got >= quota:
-                break
-            try:
-                q, a, img_obj = adapt_fv(ex)
-                img = to_pil_rgb(img_obj)
-                yield {
-                    "source": "general",
-                    "question": q.strip(),
-                    "context": "",
-                    "answer": a.strip(),
-                    "image": img,  # PIL
-                }
-                got += 1
-                progressed = True
-            except Exception:
-                continue
-
-        if not progressed:
-            raise RuntimeError(
-                f"FineVision subset '{subset}' could not provide more valid samples. Produced {got}/{quota}."
-            )
+def parse_solution(text: str) -> str:
+    m = _SOL_RE.search(text or "")
+    return m.group(1).strip() if m else ""
 
 
-def finevision_iterator(
-    total_n: int,
-    weights: Dict[str, float],
-    seed: int,
-) -> Iterator[dict]:
-    weights = normalize_weights(weights)
-    quotas = allocate_quotas(total_n, weights)
-
-    rng = random.Random(seed)
-    subsets = list(quotas.keys())
-    rng.shuffle(subsets)
-
-    for subset in subsets:
-        quota = int(quotas.get(subset, 0))
-        if quota <= 0:
-            continue
-        for item in finevision_subset_iterator(subset, quota, seed=seed):
-            yield item
+def parse_model_answer(raw_text: str, force_float: bool) -> str:
+    raw_text = (raw_text or "").strip()
+    sol = extract_solution_block(raw_text)
+    if sol is not None:
+        if force_float:
+            f = extract_single_float(sol)
+            return f if f is not None else sol
+        return sol
+    if force_float:
+        f = extract_single_float(raw_text)
+        return f if f is not None else raw_text
+    return raw_text
 
 
 # ==========================
-# Mixture generator (seed stream)
+# PROMPTS (FIXED — reference style)
 # ==========================
-def mixture_generator(
-    domain_jsonl_path: str,
-    include_logo: bool,
-    domain_count: int,
-    general_count: int,
-    general_weights: Dict[str, float],
-    seed: int,
-) -> Iterator[dict]:
-    """
-    Produces exactly domain_count + general_count items.
-    Interleaves with probability proportional to remaining counts.
-    """
-    rng = random.Random(seed)
-    dom_it = domain_iterator(domain_jsonl_path, include_logo=include_logo, seed=seed)
-    gen_it = finevision_iterator(total_n=general_count, weights=general_weights, seed=seed)
+def build_gen_prompt(ex: Dict, force_float: bool = False) -> str:
+    q = str(ex.get("question", "")).strip()
+    c = str(ex.get("context", "")).strip()
 
-    remD = int(domain_count)
-    remG = int(general_count)
+    if c:
+        q_text = f"Context: {c}\n\nQuestion: {q}"
+    else:
+        q_text = q
 
-    while remD > 0 or remG > 0:
-        if remD == 0:
-            x = next(gen_it)
-            remG -= 1
-            yield x
-            continue
-        if remG == 0:
-            x = next(dom_it)
-            remD -= 1
-            yield x
-            continue
+    if force_float:
+        solution_rule = (
+            f"and then your final answer between {SOLUTION_START} and {SOLUTION_END}. "
+            f"Put a single float inside {SOLUTION_START}{SOLUTION_END}."
+        )
+    else:
+        solution_rule = (
+            f"and then your final answer between {SOLUTION_START} and {SOLUTION_END}. "
+            f"Put only the final answer inside {SOLUTION_START}{SOLUTION_END}."
+        )
 
-        if rng.random() < (remD / float(remD + remG)):
-            x = next(dom_it)
-            remD -= 1
-            yield x
-        else:
-            x = next(gen_it)
-            remG -= 1
-            yield x
+    return (
+        f"{q_text}\n"
+        f"Also first provide your reasoning or working out on how you "
+        f"would go about solving the question "
+        f"between {REASONING_START} and {REASONING_END} "
+        f"{solution_rule}"
+    )
 
 
-# ==========================
-# Best params loader (domain_ratio + FineVision weights)
-# ==========================
-def load_best_params(best_params_json: str) -> Tuple[float, Dict[str, float]]:
-    best = json.load(open(best_params_json, "r", encoding="utf-8"))
-    if "domain_ratio" not in best:
-        raise ValueError("best_params_json must contain key: domain_ratio")
+def build_cls_prompt(ex: Dict) -> str:
+    q = str(ex.get("question", "")).strip()
+    c = str(ex.get("context", "")).strip()
+    gold = str(ex.get("answer", "")).strip()
+    proposed = str(ex.get("generated_c", "")).strip()
 
-    domain_ratio = float(best["domain_ratio"])
-    weights: Dict[str, float] = {}
-
-    for k, v in best.items():
-        if k.startswith("w_"):
-            weights[k[len("w_"):]] = float(v)
-
-    for s in DEFAULT_FINEVISION_SUBSETS:
-        weights.setdefault(s, 0.0)
-
-    return domain_ratio, weights
+    return (
+        "You are a vision language model that checks answers for questions about patent images.\n"
+        "Task: Decide if the proposed answer is correct or incorrect.\n"
+        "Rules:\n"
+        "1. Look at the question, context, image, and the ground truth answer.\n"
+        "2. Compare the proposed answer with the ground truth answer in meaning and detail.\n"
+        "3. Reply with exactly one word: correct or incorrect.\n"
+        "4. Do not add any extra words or punctuation.\n"
+        f"Context: {c}\n"
+        f"Question: {q}\n"
+        f"Ground truth answer: {gold}\n"
+        f"Proposed answer: {proposed}\n"
+        "Reply with only one word:"
+    )
 
 
 # ==========================
-# Dual adapter manager
+# FORMATTERS — IMAGE EMBEDDED IN CONTENT
+# ==========================
+def format_for_gen(ex: Dict, cfg: AlgoConfig) -> Dict:
+    user_text = build_gen_prompt(ex, force_float=cfg.force_float_solution)
+
+    gold = str(ex.get("answer", "")).strip()
+    if cfg.force_float_solution:
+        f = extract_single_float(gold)
+        gold = f if f is not None else gold
+
+    rationale = str(ex.get("generated_rationale", "")).strip()
+
+    assistant_text = (
+        f"{REASONING_START}{rationale}{REASONING_END}\n"
+        f"{SOLUTION_START}{gold}{SOLUTION_END}"
+    )
+
+    return {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": ex["image"]},
+                    {"type": "text", "text": user_text},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": assistant_text}],
+            },
+        ]
+    }
+
+
+def format_for_cls(ex: Dict) -> Dict:
+    user_text = build_cls_prompt(ex)
+    label = str(ex.get("answer_correct", "")).strip()
+
+    return {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": ex["image"]},
+                    {"type": "text", "text": user_text},
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": label}],
+            },
+        ]
+    }
+
+
+# ==========================
+# MODEL MANAGER (PEFT SAFE)
 # ==========================
 class DualModelManager:
     def __init__(self, cfg: AlgoConfig):
@@ -431,8 +309,11 @@ class DualModelManager:
             use_gradient_checkpointing="unsloth",
         )
 
-        self._init_adapter(cfg.gen_adapter_path)
-        self._init_adapter(cfg.cls_adapter_path)
+        self.gen_path = Path(cfg.out_dir) / "generator_adapter"
+        self.cls_path = Path(cfg.out_dir) / "classifier_adapter"
+
+        self._init_adapter(str(self.gen_path))
+        self._init_adapter(str(self.cls_path))
 
     def _init_adapter(self, path: str):
         if not os.path.exists(path):
@@ -452,8 +333,7 @@ class DualModelManager:
             )
             self.model.save_pretrained(path)
             self.tokenizer.save_pretrained(path)
-
-            print("Reset model state after init adapter")
+            print(f"Saved initial adapter to {path}")
             try:
                 self.model = self.model.unload()
             except Exception:
@@ -464,7 +344,6 @@ class DualModelManager:
             self.model = self.model.unload()
         except Exception:
             pass
-
         if hasattr(self.model, "peft_config"):
             for name in list(self.model.peft_config.keys()):
                 try:
@@ -475,7 +354,7 @@ class DualModelManager:
     def load_generator(self, inference: bool = False):
         print("Swapping to GENERATOR adapter")
         self._clean_active_adapters()
-        self.model.load_adapter(self.cfg.gen_adapter_path, adapter_name="generator")
+        self.model.load_adapter(str(self.gen_path), adapter_name="generator")
         self.model.set_adapter("generator")
         if inference:
             FastVisionModel.for_inference(self.model)
@@ -485,7 +364,7 @@ class DualModelManager:
     def load_classifier(self, inference: bool = False):
         print("Swapping to CLASSIFIER adapter")
         self._clean_active_adapters()
-        self.model.load_adapter(self.cfg.cls_adapter_path, adapter_name="classifier")
+        self.model.load_adapter(str(self.cls_path), adapter_name="classifier")
         self.model.set_adapter("classifier")
         if inference:
             FastVisionModel.for_inference(self.model)
@@ -494,336 +373,221 @@ class DualModelManager:
 
 
 # ==========================
-# Output parsing
+# MG → DISK (FIXED: tokenizer call + fallback)
 # ==========================
-_SOLUTION_RE = re.compile(
-    re.escape(SOLUTION_START) + r"(.*?)" + re.escape(SOLUTION_END),
-    flags=re.DOTALL | re.IGNORECASE,
-)
-_FLOAT_RE = re.compile(r"[-+]?\d*\.?\d+(?:[eE][-+]?\d+)?")
+def mg_generate(manager: DualModelManager, batch: List[Dict], out_path: Path):
+    manager.load_generator(True)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-def extract_solution_block(text: str) -> Optional[str]:
-    m = _SOLUTION_RE.search((text or "").strip())
-    if not m:
-        return None
-    return m.group(1).strip()
+    with out_path.open("w", encoding="utf-8") as f:
+        for ex in tqdm(batch, desc="MG generate"):
+            msgs = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": build_gen_prompt(ex, force_float=manager.cfg.force_float_solution)},
+                    ],
+                }
+            ]
 
-def extract_single_float(text: str) -> Optional[str]:
-    m = _FLOAT_RE.search((text or "").strip())
-    if not m:
-        return None
-    return m.group(0)
+            input_text = manager.tokenizer.apply_chat_template(
+                msgs,
+                add_generation_prompt=True,
+            )
 
-def parse_model_answer(raw_text: str, force_float: bool) -> str:
-    raw_text = (raw_text or "").strip()
-    sol = extract_solution_block(raw_text)
-    if sol is not None:
-        if force_float:
-            f = extract_single_float(sol)
-            return f if f is not None else sol
-        return sol
-    if force_float:
-        f = extract_single_float(raw_text)
-        return f if f is not None else raw_text
-    return raw_text
+            # FIX: positional args — image first, text second
+            inputs = manager.tokenizer(
+                ex["image"],
+                input_text,
+                add_special_tokens=False,
+                return_tensors="pt",
+            ).to("cuda")
 
+            with torch.inference_mode():
+                out = manager.model.generate(
+                    **inputs,
+                    max_new_tokens=manager.cfg.gen_max_new_tokens,
+                    use_cache=True,
+                )
 
-# ==========================
-# Prompt formatting (YOUR style)
-# ==========================
-def build_gen_prompt(example: Dict[str, Any], force_float: bool) -> str:
-    q = str(example.get("question", "")).strip()
-    c = str(example.get("context", "")).strip()
+            prompt_len = inputs["input_ids"].shape[1]
+            decoded = manager.tokenizer.decode(
+                out[0][prompt_len:],
+                skip_special_tokens=True,
+            ).strip()
 
-    if c:
-        q_text = f"Context: {c}\n\nQuestion: {q}"
-    else:
-        q_text = q
+            # Extract rationale
+            rationale = ""
+            if REASONING_START in decoded and REASONING_END in decoded:
+                m = re.search(
+                    f"{REASONING_START}(.*?){REASONING_END}",
+                    decoded, re.DOTALL,
+                )
+                if m:
+                    rationale = m.group(1).strip()
 
-    if force_float:
-        solution_rule = (
-            f"and then your final answer between {SOLUTION_START} and {SOLUTION_END}. "
-            f"Put a single float inside {SOLUTION_START}{SOLUTION_END}."
-        )
-    else:
-        solution_rule = (
-            f"and then your final answer between {SOLUTION_START} and {SOLUTION_END}. "
-            f"Put only the final answer inside {SOLUTION_START}{SOLUTION_END}."
-        )
+            # Fallback: if model didn't use tags, use entire output as rationale
+            if not rationale:
+                rationale = decoded.strip()
 
-    text_content = (
-        f"{q_text}\n"
-        f"Also first provide your reasoning or working out on how you would go about solving the question "
-        f"between {REASONING_START} and {REASONING_END} "
-        f"{solution_rule}"
-    )
-    return text_content
+            # Extract solution
+            solution = parse_model_answer(decoded, force_float=manager.cfg.force_float_solution)
+            if not solution:
+                solution = decoded.strip().split("\n")[-1].strip()
 
-
-def format_for_gen(example: Dict[str, Any], cfg: AlgoConfig) -> Dict[str, Any]:
-    user_text = build_gen_prompt(example, force_float=cfg.force_float_solution)
-
-    gold = str(example.get("answer", "")).strip()
-    if cfg.force_float_solution:
-        f = extract_single_float(gold)
-        gold = f if f is not None else gold
-
-    assistant_text = (
-        f"{REASONING_START}{REASONING_END}\n"
-        f"{SOLUTION_START}{gold}{SOLUTION_END}"
-    )
-
-    return {
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": user_text},
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [{"type": "text", "text": assistant_text}],
-            },
-        ]
-    }
-
-
-def build_cls_prompt(example: Dict[str, Any], proposed: str) -> str:
-    q = str(example.get("question", "")).strip()
-    c = str(example.get("context", "")).strip()
-    gold = str(example.get("answer", "")).strip()
-
-    prompt = (
-        "You are a vision language model that checks answers for questions about patent images.\n"
-        "Task: Decide if the proposed answer is correct or incorrect.\n"
-        "Rules:\n"
-        "1. Look at the question, context, image, and the ground truth answer.\n"
-        "2. Compare the proposed answer with the ground truth answer in meaning and detail.\n"
-        "3. Reply with exactly one word: correct or incorrect.\n"
-        "4. Do not add any extra words or punctuation.\n"
-        f"Context: {c}\n"
-        f"Question: {q}\n"
-        f"Ground truth answer: {gold}\n"
-        f"Proposed answer: {proposed}\n"
-        "Reply with only one word:"
-    )
-    return prompt
-
-
-def format_for_cls(example: Dict[str, Any]) -> Dict[str, Any]:
-    proposed = str(example.get("generated_c", "")).strip()
-    label = str(example.get("answer_correct", "")).strip()
-    user_text = build_cls_prompt(example, proposed)
-
-    return {
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": user_text},
-                ],
-            },
-            {
-                "role": "assistant",
-                "content": [{"type": "text", "text": label}],
-            },
-        ]
-    }
+            f.write(
+                json.dumps(
+                    {
+                        "question": ex["question"],
+                        "context": ex["context"],
+                        "answer": ex["answer"],
+                        "file": ex["file"],
+                        "generated_raw": decoded,
+                        "generated_rationale": rationale,
+                        "generated_c": solution,
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
 
 
 # ==========================
-# Algorithm steps (NO JSONL I/O, keep PIL in memory)
+# MC → DISK (FIXED: tokenizer call + lenient matching)
 # ==========================
-@torch.inference_mode()
-def step_generate_in_memory(
+def mc_validate(
     manager: DualModelManager,
-    batch_items: List[Dict[str, Any]],
-) -> List[Dict[str, Any]]:
-    manager.load_generator(inference=True)
-    out: List[Dict[str, Any]] = []
-
-    for item in tqdm(batch_items, desc="MG generate"):
-        msg = format_for_gen(item, manager.cfg)
-        msgs = [msg["messages"][0]]
-
-        input_text = manager.tokenizer.apply_chat_template(
-            msgs,
-            add_generation_prompt=True,
-        )
-
-        inputs = manager.tokenizer(
-            item["image"],  # PIL
-            input_text,
-            add_special_tokens=False,
-            return_tensors="pt",
-        ).to("cuda")
-
-        outputs = manager.model.generate(
-            **inputs,
-            max_new_tokens=manager.cfg.gen_max_new_tokens,
-            use_cache=True,
-        )
-
-        prompt_len = inputs["input_ids"].shape[1]
-        decoded = manager.tokenizer.decode(
-            outputs[0][prompt_len:],
-            skip_special_tokens=True,
-        ).strip()
-
-        parsed = parse_model_answer(decoded, force_float=manager.cfg.force_float_solution)
-
-        new_item = dict(item)
-        new_item["generated_raw"] = decoded
-        new_item["generated_c"] = parsed
-        out.append(new_item)
-
-    return out
-
-
-@torch.inference_mode()
-def step_validate_in_memory(
-    manager: DualModelManager,
-    candidates: List[Dict[str, Any]],
-) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """
-    Returns:
-      gen_train_items: only "valid" items with answer replaced by generated_c
-      cls_train_items: all items with answer_correct = correct/incorrect
-    """
-    manager.load_classifier(inference=True)
-
-    gen_train: List[Dict[str, Any]] = []
-    cls_train: List[Dict[str, Any]] = []
-
-    for item in tqdm(candidates, desc="MC validate"):
-        proposed = str(item.get("generated_c", "")).strip()
-        user_text = build_cls_prompt(item, proposed)
-
-        msgs = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image"},
-                    {"type": "text", "text": user_text},
-                ],
-            }
-        ]
-
-        input_text = manager.tokenizer.apply_chat_template(
-            msgs,
-            add_generation_prompt=True,
-        )
-
-        inputs = manager.tokenizer(
-            item["image"],  # PIL
-            input_text,
-            add_special_tokens=False,
-            return_tensors="pt",
-        ).to("cuda")
-
-        outputs = manager.model.generate(
-            **inputs,
-            max_new_tokens=manager.cfg.cls_max_new_tokens,
-            use_cache=True,
-        )
-
-        prompt_len = inputs["input_ids"].shape[1]
-        verdict = manager.tokenizer.decode(
-            outputs[0][prompt_len:],
-            skip_special_tokens=True,
-        ).lower().strip()
-
-        is_valid = verdict == "correct" or ("correct" in verdict and "incorrect" not in verdict)
-
-        if is_valid:
-            g = dict(item)
-            g["answer"] = proposed
-            gen_train.append(g)
-
-            c = dict(item)
-            c["answer_correct"] = "correct"
-            cls_train.append(c)
-        else:
-            c = dict(item)
-            c["answer_correct"] = "incorrect"
-            cls_train.append(c)
-
-    return gen_train, cls_train
-
-
-def list_to_hf_dataset(items: List[Dict[str, Any]]) -> Dataset:
-    """
-    Create a HF Dataset that can carry PIL images.
-    """
-    feats = Features(
-        {
-            "source": Value("string"),
-            "question": Value("string"),
-            "context": Value("string"),
-            "answer": Value("string"),
-            "image": HFImage(),
-            # optional fields
-            "generated_raw": Value("string"),
-            "generated_c": Value("string"),
-            "answer_correct": Value("string"),
-        }
-    )
-
-    rows = []
-    for x in items:
-        rows.append(
-            {
-                "source": str(x.get("source", "")),
-                "question": str(x.get("question", "")),
-                "context": str(x.get("context", "")),
-                "answer": str(x.get("answer", "")),
-                "image": x.get("image"),
-                "generated_raw": str(x.get("generated_raw", "")),
-                "generated_c": str(x.get("generated_c", "")),
-                "answer_correct": str(x.get("answer_correct", "")),
-            }
-        )
-
-    return Dataset.from_list(rows, features=feats)
-
-
-def step_finetune_from_items(
-    manager: DualModelManager,
-    items: List[Dict[str, Any]],
-    mode: str,
+    gen_jsonl: Path,
+    domain_jsonl: str,
+    cls_jsonl: Path,
 ):
-    if len(items) == 0:
-        print(f"Skipping {mode} training, empty dataset")
+    manager.load_classifier(True)
+    gen_items, cls_items = [], []
+
+    with open(gen_jsonl) as fin, open(
+        cls_jsonl, "w", encoding="utf-8"
+    ) as fout:
+        for line in tqdm(fin, desc="MC validate"):
+            ex = json.loads(line)
+            ex["image"] = to_pil_rgb(
+                resolve_image(domain_jsonl, ex["file"])
+            )
+
+            msgs = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": build_cls_prompt(ex)},
+                    ],
+                }
+            ]
+
+            input_text = manager.tokenizer.apply_chat_template(
+                msgs,
+                add_generation_prompt=True,
+            )
+
+            # FIX: positional args — image first, text second
+            inputs = manager.tokenizer(
+                ex["image"],
+                input_text,
+                add_special_tokens=False,
+                return_tensors="pt",
+            ).to("cuda")
+
+            with torch.inference_mode():
+                out = manager.model.generate(
+                    **inputs,
+                    max_new_tokens=manager.cfg.cls_max_new_tokens,
+                    use_cache=True,
+                )
+
+            prompt_len = inputs["input_ids"].shape[1]
+            verdict = manager.tokenizer.decode(
+                out[0][prompt_len:],
+                skip_special_tokens=True,
+            ).strip().lower()
+
+            # FIX: lenient matching
+            is_correct = "correct" in verdict and "incorrect" not in verdict
+
+            out_ex = dict(ex)
+            out_ex.pop("image", None)
+            out_ex["answer_correct"] = "correct" if is_correct else "incorrect"
+            fout.write(json.dumps(out_ex, ensure_ascii=False) + "\n")
+
+            # Always collect if we have a rationale (don't skip on empty)
+            if ex["generated_rationale"]:
+                if is_correct:
+                    gen_items.append(
+                        {
+                            "question": ex["question"],
+                            "context": ex["context"],
+                            "answer": ex["generated_c"],
+                            "generated_rationale": ex["generated_rationale"],
+                            "image": ex["image"],
+                        }
+                    )
+
+                cls_items.append(
+                    {
+                        "question": ex["question"],
+                        "context": ex["context"],
+                        "answer": ex["generated_c"],
+                        "generated_rationale": ex["generated_rationale"],
+                        "answer_correct": "correct" if is_correct else "incorrect",
+                        "image": ex["image"],
+                    }
+                )
+
+    return gen_items, cls_items
+
+
+# ==========================
+# BUILD DATASET DIRECTLY (NO .map() — avoids serialisation issues)
+# ==========================
+def build_gen_dataset(items: List[Dict], cfg: AlgoConfig) -> Dataset:
+    formatted = []
+    for ex in items:
+        formatted.append(format_for_gen(ex, cfg))
+    return Dataset.from_list(formatted)
+
+
+def build_cls_dataset(items: List[Dict]) -> Dataset:
+    formatted = []
+    for ex in items:
+        formatted.append(format_for_cls(ex))
+    return Dataset.from_list(formatted)
+
+
+# ==========================
+# FINETUNE
+# ==========================
+def finetune(manager: DualModelManager, items: List[Dict], mode: str):
+    if not items:
+        print(f"  [finetune] No items for {mode}, skipping.")
         return
 
+    print(f"  [finetune] Training {mode} on {len(items)} examples ...")
+
     if mode == "generator":
-        manager.load_generator(inference=False)
-        save_path = manager.cfg.gen_adapter_path
-
-        def _format(ex):
-            return format_for_gen(ex, manager.cfg)
+        manager.load_generator(False)
+        ds = build_gen_dataset(items, manager.cfg)
+        save_path = manager.gen_path
     else:
-        manager.load_classifier(inference=False)
-        save_path = manager.cfg.cls_adapter_path
-
-        def _format(ex):
-            return format_for_cls(ex)
-
-    hf_dataset = list_to_hf_dataset(items)
-
-    train_dataset = hf_dataset.map(
-        _format,
-        remove_columns=hf_dataset.column_names,
-    )
+        manager.load_classifier(False)
+        ds = build_cls_dataset(items)
+        save_path = manager.cls_path
 
     trainer = SFTTrainer(
         model=manager.model,
         tokenizer=manager.tokenizer,
-        data_collator=UnslothVisionDataCollator(manager.model, manager.tokenizer),
-        train_dataset=train_dataset,
+        data_collator=UnslothVisionDataCollator(
+            manager.model, manager.tokenizer
+        ),
+        train_dataset=ds,
         args=SFTConfig(
             per_device_train_batch_size=manager.cfg.batch_size,
             gradient_accumulation_steps=manager.cfg.grad_accum,
@@ -843,9 +607,10 @@ def step_finetune_from_items(
     )
 
     trainer.train()
-    print(f"Saving updated {mode} adapter to {save_path}")
-    manager.model.save_pretrained(save_path)
-    manager.tokenizer.save_pretrained(save_path)
+
+    print(f"  Saving updated {mode} adapter to {save_path}")
+    manager.model.save_pretrained(str(save_path))
+    manager.tokenizer.save_pretrained(str(save_path))
 
     del trainer
     gc.collect()
@@ -854,48 +619,31 @@ def step_finetune_from_items(
 
 
 # ==========================
-# Main loop (stream seed + Algo1)
+# MAIN
 # ==========================
 def main():
     p = argparse.ArgumentParser()
-
-    p.add_argument("--domain_data", required=True, help="Domain JSONL path (with file/image, question, answer, context)")
-    p.add_argument("--best_params_json", required=True, help="Contains domain_ratio and w_* weights")
-    p.add_argument("--output_dir", default="algo1_outputs_stream")
-
-    # Algo controls
+    p.add_argument("--domain_data", required=True,
+                   help="Path to JSONL with fields: question, context, answer, file")
     p.add_argument("--iterations_k", type=int, default=3)
     p.add_argument("--step_size_j", type=int, default=500)
-
-    # Model
+    p.add_argument("--seed", type=int, default=42)
     p.add_argument("--base_model", default="unsloth/Qwen3-VL-8B-Instruct")
-    p.add_argument("--gen_adapter_path", default="checkpoints/generator_adapter")
-    p.add_argument("--cls_adapter_path", default="checkpoints/classifier_adapter")
-
-    # Train hyperparams
     p.add_argument("--max_seq_length", type=int, default=2048)
     p.add_argument("--learning_rate", type=float, default=2e-4)
     p.add_argument("--epochs_per_iter", type=int, default=1)
     p.add_argument("--batch_size", type=int, default=1)
     p.add_argument("--grad_accum", type=int, default=8)
-
-    # Generation
     p.add_argument("--gen_max_new_tokens", type=int, default=256)
     p.add_argument("--cls_max_new_tokens", type=int, default=16)
     p.add_argument("--force_float_solution", action="store_true")
-
-    # Seed mixture
-    p.add_argument("--include_logo", action="store_true")
-    p.add_argument("--seed", type=int, default=42)
-
+    p.add_argument("--out_dir", default="outputs")
     args = p.parse_args()
 
     cfg = AlgoConfig(
         base_model=args.base_model,
         iterations_k=args.iterations_k,
         step_size_j=args.step_size_j,
-        gen_adapter_path=args.gen_adapter_path,
-        cls_adapter_path=args.cls_adapter_path,
         max_seq_length=args.max_seq_length,
         learning_rate=args.learning_rate,
         epochs_per_iter=args.epochs_per_iter,
@@ -903,80 +651,49 @@ def main():
         grad_accum=args.grad_accum,
         gen_max_new_tokens=args.gen_max_new_tokens,
         cls_max_new_tokens=args.cls_max_new_tokens,
-        include_logo=args.include_logo,
         force_float_solution=args.force_float_solution,
-        out_dir=args.output_dir,
+        out_dir=args.out_dir,
     )
 
     random.seed(args.seed)
     Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
 
-    # Load mix params
-    domain_ratio, weights = load_best_params(args.best_params_json)
-    if not (0.0 < domain_ratio < 1.0):
-        raise ValueError("domain_ratio must be between 0 and 1")
-
-    # Count domain usable samples
-    D = count_domain_samples(args.domain_data, include_logo=cfg.include_logo)
-    if D <= 0:
-        raise ValueError("Domain dataset is empty after filtering / image load checks.")
-
-    # General count derived from ratio: domain_ratio = D / (D + G)
-    G = int(round(D * (1.0 - domain_ratio) / domain_ratio))
-
-    print(f"[seed mix] domain_count={D}")
-    print(f"[seed mix] general_count={G}")
-    print(f"[seed mix] domain_ratio={domain_ratio}")
-
-    # Build stream generator
-    seed_stream = mixture_generator(
-        domain_jsonl_path=args.domain_data,
-        include_logo=cfg.include_logo,
-        domain_count=D,
-        general_count=G,
-        general_weights=weights,
-        seed=args.seed,
-    )
-
+    stream = domain_iterator(args.domain_data, args.seed)
     manager = DualModelManager(cfg)
 
-    # Consume the stream in iteration batches
-    total_consumed = 0
-    for it in range(1, cfg.iterations_k + 1):
-        print(f"\n=== Iteration {it}/{cfg.iterations_k} ===")
-        batch: List[Dict[str, Any]] = []
+    for it in range(cfg.iterations_k):
+        print(f"\n{'='*50}")
+        print(f"  ITERATION {it+1}/{cfg.iterations_k}")
+        print(f"{'='*50}")
 
+        batch = []
         for _ in range(cfg.step_size_j):
             try:
-                batch.append(next(seed_stream))
+                batch.append(next(stream))
             except StopIteration:
                 break
 
-        if len(batch) == 0:
-            print("Seed stream exhausted. Stopping.")
+        if not batch:
+            print("  No more data, stopping.")
             break
 
-        total_consumed += len(batch)
-        print(f"[iter] batch_size={len(batch)} total_consumed={total_consumed}")
+        print(f"  Batch size: {len(batch)}")
 
-        # Step 1: generate candidates
-        candidates = step_generate_in_memory(manager, batch)
+        gen_p = Path(cfg.out_dir) / f"iter_{it}_gen.jsonl"
+        cls_p = Path(cfg.out_dir) / f"iter_{it}_cls.jsonl"
 
-        # Step 2: validate candidates
-        gen_items, cls_items = step_validate_in_memory(manager, candidates)
+        mg_generate(manager, batch, gen_p)
+        gen_items, cls_items = mc_validate(
+            manager, gen_p, args.domain_data, cls_p
+        )
 
-        print(f"[iter] gen_train_items={len(gen_items)} cls_train_items={len(cls_items)}")
+        print(f"  Generator training samples: {len(gen_items)}")
+        print(f"  Classifier training samples: {len(cls_items)}")
 
-        # Step 3: finetune adapters
-        print("--- Fine tuning Generator (MG) ---")
-        step_finetune_from_items(manager, gen_items, mode="generator")
+        finetune(manager, gen_items, "generator")
+        finetune(manager, cls_items, "classifier")
 
-        print("--- Fine tuning Classifier (MC) ---")
-        step_finetune_from_items(manager, cls_items, mode="classifier")
-
-    print("Done. Adapters saved at:")
-    print(" -", cfg.gen_adapter_path)
-    print(" -", cfg.cls_adapter_path)
+    print("\nDONE")
 
 
 if __name__ == "__main__":
